@@ -1,7 +1,37 @@
-# Copy to terraform.tfvars and fill in your values before running terraform apply.
-# terraform.tfvars is gitignored to avoid committing project IDs.
+# Copy to terraform.tfvars for local runs.
+# In CI, these are set via -var flags or environment variables (TF_VAR_*).
+# DO NOT commit terraform.tfvars — it is gitignored.
 
-gcp_project = "your-gcp-project-id"
-gcp_region  = "us-central1"
-image_tag   = "latest"
-log_level   = "INFO"
+gcp_project            = "agentic-sre-500001"
+gcp_region             = "us-central1"
+artifact_registry_repo = "agentic-sre"
+
+# Cloud Run
+cloud_run_service_name    = "agentic-sre-agent"
+cloud_run_min_instances   = 0
+cloud_run_max_instances   = 10
+cloud_run_cpu             = "1"
+cloud_run_memory          = "512Mi"
+cloud_run_timeout_seconds = 60
+cloud_run_concurrency     = 80
+
+# Application
+log_level               = "INFO"
+firestore_database_name = "agentic-sre-db"
+alert_group_ttl_minutes = 60
+
+# Pub/Sub
+pubsub_topic_name                = "agentic-sre-fallback-alerts"
+pubsub_message_retention_seconds = 86400
+pubsub_max_delivery_attempts     = 5
+
+# Cloud Tasks
+cloud_tasks_queue_name                = "agentic-sre-incidents"
+cloud_tasks_max_dispatches_per_second = 10
+cloud_tasks_max_concurrent_dispatches = 5
+cloud_tasks_max_attempts              = 5
+
+# Service Account
+app_sa_name = "agentic-sre-agent"
+
+# image_tag is injected by CI — do not set here

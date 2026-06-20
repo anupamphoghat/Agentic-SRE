@@ -1,0 +1,238 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+# Prevent concurrent deployments — queue them instead
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: agentic-sre-500001
+  GCP_REGION: us-central1
+  ARTIFACT_REGISTRY_REPO: agentic-sre
+  TF_STATE_BUCKET: agentic-sre-500001-tfstate
+  TF_STATE_PREFIX: terraform/state
+  TERRAFORM_VERSION: "~1.6"
+
+jobs:
+  # ── 1. Tests ─────────────────────────────────────────────────────────────────
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-cov
+
+      - name: Run tests
+        run: pytest tests/ -v --cov=src --cov-report=term-missing --cov-fail-under=80
+
+  # ── 2. Build & push Docker image ─────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+
+    # Required for Workload Identity Federation
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Generate image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | head -c 8)
+          echo "tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${SHORT_SHA}"
+
+      - name: Build Docker image
+        env:
+          IMAGE_BASE: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.ARTIFACT_REGISTRY_REPO }}/agentic-sre
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker build \
+            --tag "${IMAGE_BASE}:${TAG}" \
+            --tag "${IMAGE_BASE}:latest" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            --label "org.opencontainers.image.source=${{ github.repository }}" \
+            .
+
+      - name: Push Docker image
+        env:
+          IMAGE_BASE: ${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.ARTIFACT_REGISTRY_REPO }}/agentic-sre
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker push "${IMAGE_BASE}:${TAG}"
+          docker push "${IMAGE_BASE}:latest"
+
+  # ── 3. Terraform plan ─────────────────────────────────────────────────────────
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: build
+
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ env.TF_STATE_PREFIX }}"
+
+      - name: Terraform Validate
+        working-directory: deploy/terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        id: plan
+        working-directory: deploy/terraform
+        env:
+          TF_VAR_gcp_project: ${{ env.GCP_PROJECT }}
+          TF_VAR_gcp_region: ${{ env.GCP_REGION }}
+          TF_VAR_image_tag: ${{ needs.build.outputs.image_tag }}
+          TF_VAR_artifact_registry_repo: ${{ env.ARTIFACT_REGISTRY_REPO }}
+          TF_VAR_log_level: ${{ vars.LOG_LEVEL || 'INFO' }}
+          TF_VAR_cloud_run_min_instances: ${{ vars.CLOUD_RUN_MIN_INSTANCES || '0' }}
+          TF_VAR_cloud_run_max_instances: ${{ vars.CLOUD_RUN_MAX_INSTANCES || '10' }}
+          TF_VAR_cloud_run_memory: ${{ vars.CLOUD_RUN_MEMORY || '512Mi' }}
+          TF_VAR_cloud_run_cpu: ${{ vars.CLOUD_RUN_CPU || '1' }}
+        run: |
+          terraform plan \
+            -out=tfplan \
+            -no-color \
+            -detailed-exitcode 2>&1 | tee plan_output.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan
+          path: deploy/terraform/tfplan
+          retention-days: 1
+
+  # ── 4. Terraform apply ────────────────────────────────────────────────────────
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: [build, terraform-plan]
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.WIF_PROVIDER }}
+          service_account: ${{ secrets.WIF_SERVICE_ACCOUNT }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        working-directory: deploy/terraform
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ env.TF_STATE_BUCKET }}" \
+            -backend-config="prefix=${{ env.TF_STATE_PREFIX }}"
+
+      - name: Download plan artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan
+          path: deploy/terraform
+
+      - name: Terraform Apply
+        working-directory: deploy/terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Set Anthropic API Key in Secret Manager
+        # Only runs if the GitHub secret is set — skips gracefully if not
+        if: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          echo -n "${ANTHROPIC_API_KEY}" | \
+            gcloud secrets versions add anthropic-api-key \
+              --project="${{ env.GCP_PROJECT }}" \
+              --data-file=-
+
+      - name: Get Cloud Run URL
+        id: cloud_run
+        run: |
+          URL=$(gcloud run services describe agentic-sre-agent \
+            --project="${{ env.GCP_PROJECT }}" \
+            --region="${{ env.GCP_REGION }}" \
+            --format="value(status.url)")
+          echo "url=${URL}" >> "$GITHUB_OUTPUT"
+          echo "Deployed to: ${URL}"
+
+      - name: Smoke test — health check
+        run: |
+          URL="${{ steps.cloud_run.outputs.url }}"
+          echo "Testing ${URL}/health ..."
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${URL}/health")
+          if [ "${STATUS}" != "200" ]; then
+            echo "Health check failed — got HTTP ${STATUS}"
+            exit 1
+          fi
+          echo "Health check passed (HTTP 200)"
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Commit**: \`${{ github.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image tag**: \`${{ needs.build.outputs.image_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Service URL**: ${{ steps.cloud_run.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Health**: ✅ 200 OK" >> "$GITHUB_STEP_SUMMARY"
