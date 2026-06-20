@@ -1,0 +1,7 @@
+# Copy to terraform.tfvars and fill in your values before running terraform apply.
+# terraform.tfvars is gitignored to avoid committing project IDs.
+
+gcp_project = "your-gcp-project-id"
+gcp_region  = "us-central1"
+image_tag   = "latest"
+log_level   = "INFO"
