@@ -1,12 +1,15 @@
 name: CI
 
+# Runs on pull requests only.
+# Deployment on push to main is handled by Cloud Build (cloudbuild.yaml).
+
 on:
   pull_request:
     branches: [main]
 
 jobs:
   test:
-    name: Lint & Test
+    name: Unit Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -21,11 +24,15 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt pytest pytest-cov
 
-      - name: Run tests
-        run: pytest tests/ -v --cov=src --cov-report=term-missing --cov-fail-under=80
+      - name: Run tests with coverage
+        run: |
+          pytest tests/ -v \
+            --cov=src \
+            --cov-report=term-missing \
+            --cov-fail-under=80
 
-  terraform-validate:
-    name: Terraform Validate
+  terraform-check:
+    name: Terraform Format & Validate
     runs-on: ubuntu-latest
 
     steps:
@@ -40,10 +47,16 @@ jobs:
         working-directory: deploy/terraform
         run: terraform fmt -check -recursive
 
-      - name: Terraform Init (validation only — no backend)
+      - name: Terraform Init (no backend — validation only)
         working-directory: deploy/terraform
         run: terraform init -backend=false
 
       - name: Terraform Validate
         working-directory: deploy/terraform
         run: terraform validate
+
+      - name: Bootstrap Terraform Validate
+        working-directory: deploy/bootstrap
+        run: |
+          terraform init -backend=false
+          terraform validate

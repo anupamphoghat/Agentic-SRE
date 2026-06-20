@@ -30,8 +30,14 @@ variable "artifact_registry_repo" {
   default     = "agentic-sre"
 }
 
-variable "cicd_sa_name" {
-  description = "Service account ID used by GitHub Actions CI/CD"
+variable "cloudbuild_sa_name" {
+  description = "Service account ID used by Cloud Build for deployments"
   type        = string
-  default     = "github-actions-cicd"
+  default     = "cloudbuild-deploy"
+}
+
+variable "github_ci_sa_name" {
+  description = "Service account ID used by GitHub Actions PR checks (CI only)"
+  type        = string
+  default     = "github-actions-ci"
 }

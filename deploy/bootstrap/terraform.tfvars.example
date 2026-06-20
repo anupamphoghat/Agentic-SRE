@@ -1,10 +1,8 @@
-# Copy to terraform.tfvars before running bootstrap.
-# Run this ONCE with a user account that has Project Owner.
-
 gcp_project            = "agentic-sre-500001"
 gcp_region             = "us-central1"
 github_owner           = "anupamphoghat"
 github_repo            = "Agentic-SRE"
 tfstate_bucket_name    = "agentic-sre-500001-tfstate"
 artifact_registry_repo = "agentic-sre"
-cicd_sa_name           = "github-actions-cicd"
+cloudbuild_sa_name     = "cloudbuild-deploy"
+github_ci_sa_name      = "github-actions-ci"

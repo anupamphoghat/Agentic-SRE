@@ -1,0 +1,178 @@
+################################################################################
+# Cloud Build — Deploy Pipeline
+# Triggered automatically on every push to the `main` branch.
+#
+# Pipeline stages:
+#   1. Unit tests
+#   2. Build & push Docker image to Artifact Registry (tagged with $SHORT_SHA)
+#   3. terraform init  (GCS remote state)
+#   4. terraform plan
+#   5. terraform apply
+#   6. Smoke test — GET /health must return 200
+#
+# Substitutions (set via Cloud Build trigger or terraform.tfvars):
+#   _GCP_REGION            : GCP region (default us-central1)
+#   _ARTIFACT_REGISTRY_REPO: Artifact Registry repo name (default agentic-sre)
+#   _TF_STATE_BUCKET       : GCS bucket for Terraform state
+#   _TF_STATE_PREFIX       : GCS path prefix for state (default terraform/state)
+#   _LOG_LEVEL             : App log level (default INFO)
+################################################################################
+
+substitutions:
+  _GCP_REGION: us-central1
+  _ARTIFACT_REGISTRY_REPO: agentic-sre
+  _TF_STATE_BUCKET: agentic-sre-500001-tfstate
+  _TF_STATE_PREFIX: terraform/state
+  _LOG_LEVEL: INFO
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  dynamic_substitutions: true
+
+# Pull ANTHROPIC_API_KEY from Secret Manager so it can be written into the
+# app's secret container after terraform creates it.
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/anthropic-api-key/versions/latest
+      env: ANTHROPIC_API_KEY
+
+steps:
+  # ── Stage 1: Unit tests ────────────────────────────────────────────────────
+  - id: test
+    name: python:3.12-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -r requirements.txt pytest pytest-cov --quiet
+        pytest tests/ -v \
+          --cov=src \
+          --cov-report=term-missing \
+          --cov-fail-under=80
+
+  # ── Stage 2a: Build Docker image ───────────────────────────────────────────
+  - id: docker-build
+    name: gcr.io/cloud-builders/docker
+    waitFor: [test]
+    args:
+      - build
+      - --tag
+      - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:$SHORT_SHA
+      - --tag
+      - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:latest
+      - --label
+      - org.opencontainers.image.revision=$COMMIT_SHA
+      - --label
+      - org.opencontainers.image.source=https://github.com/$_HEAD_REPO_URL
+      - --cache-from
+      - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:latest
+      - .
+
+  # ── Stage 2b: Push Docker image ────────────────────────────────────────────
+  - id: docker-push-sha
+    name: gcr.io/cloud-builders/docker
+    waitFor: [docker-build]
+    args:
+      - push
+      - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:$SHORT_SHA
+
+  - id: docker-push-latest
+    name: gcr.io/cloud-builders/docker
+    waitFor: [docker-build]
+    args:
+      - push
+      - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:latest
+
+  # ── Stage 3: Terraform init ────────────────────────────────────────────────
+  - id: tf-init
+    name: hashicorp/terraform:1.6
+    waitFor: [docker-push-sha, docker-push-latest]
+    entrypoint: terraform
+    dir: deploy/terraform
+    args:
+      - init
+      - -input=false
+      - -backend-config=bucket=${_TF_STATE_BUCKET}
+      - -backend-config=prefix=${_TF_STATE_PREFIX}
+
+  # ── Stage 4: Terraform plan ────────────────────────────────────────────────
+  - id: tf-plan
+    name: hashicorp/terraform:1.6
+    waitFor: [tf-init]
+    entrypoint: terraform
+    dir: deploy/terraform
+    env:
+      - TF_VAR_gcp_project=$PROJECT_ID
+      - TF_VAR_gcp_region=${_GCP_REGION}
+      - TF_VAR_image_tag=$SHORT_SHA
+      - TF_VAR_artifact_registry_repo=${_ARTIFACT_REGISTRY_REPO}
+      - TF_VAR_log_level=${_LOG_LEVEL}
+    args:
+      - plan
+      - -input=false
+      - -out=tfplan
+      - -no-color
+
+  # ── Stage 5: Terraform apply ───────────────────────────────────────────────
+  - id: tf-apply
+    name: hashicorp/terraform:1.6
+    waitFor: [tf-plan]
+    entrypoint: terraform
+    dir: deploy/terraform
+    env:
+      - TF_VAR_gcp_project=$PROJECT_ID
+      - TF_VAR_gcp_region=${_GCP_REGION}
+      - TF_VAR_image_tag=$SHORT_SHA
+      - TF_VAR_artifact_registry_repo=${_ARTIFACT_REGISTRY_REPO}
+      - TF_VAR_log_level=${_LOG_LEVEL}
+    args:
+      - apply
+      - -input=false
+      - -auto-approve
+      - tfplan
+
+  # ── Stage 6: Write Anthropic API key into Secret Manager ──────────────────
+  # The terraform-managed secret container was created in Stage 5.
+  # This step writes the live key value (sourced from Secret Manager via
+  # availableSecrets above) into the app's secret.
+  - id: set-anthropic-secret
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    waitFor: [tf-apply]
+    entrypoint: bash
+    secretEnv: [ANTHROPIC_API_KEY]
+    args:
+      - -c
+      - |
+        echo -n "$$ANTHROPIC_API_KEY" | \
+          gcloud secrets versions add anthropic-api-key \
+            --project="$PROJECT_ID" \
+            --data-file=-
+
+  # ── Stage 7: Smoke test ────────────────────────────────────────────────────
+  - id: smoke-test
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    waitFor: [set-anthropic-secret]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        URL=$(gcloud run services describe agentic-sre-agent \
+          --project="$PROJECT_ID" \
+          --region="${_GCP_REGION}" \
+          --format="value(status.url)")
+
+        echo "Smoke testing: ${URL}/health"
+        STATUS=$(curl -sf -o /dev/null -w "%{http_code}" "${URL}/health")
+
+        if [ "${STATUS}" != "200" ]; then
+          echo "FAIL: /health returned HTTP ${STATUS}"
+          exit 1
+        fi
+        echo "PASS: /health returned HTTP 200"
+
+# Push both image tags as build artifacts for audit trail
+images:
+  - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:$SHORT_SHA
+  - ${_GCP_REGION}-docker.pkg.dev/$PROJECT_ID/${_ARTIFACT_REGISTRY_REPO}/agentic-sre:latest
+
+timeout: 1800s  # 30 minutes max
